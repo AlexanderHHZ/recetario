@@ -1,0 +1,128 @@
+/* ============================================================
+   RECETARIO DIGITAL — Estilos globales
+   src/app/globals.css
+   ============================================================ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Tokens de diseño ──────────────────────────────────────── */
+@layer base {
+  :root {
+    /* Naranja marca */
+    --color-brand:        #f97316;   /* orange-500 */
+    --color-brand-dark:   #ea580c;   /* orange-600 */
+    --color-brand-light:  #fff7ed;   /* orange-50  */
+
+    /* Neutros */
+    --color-bg:           #fafaf9;   /* stone-50   */
+    --color-surface:      #ffffff;
+    --color-border:       #e7e5e4;   /* stone-200  */
+    --color-text:         #1c1917;   /* stone-900  */
+    --color-muted:        #78716c;   /* stone-500  */
+  }
+
+  /* Base tipográfica */
+  html {
+    font-family: var(--font-sans), system-ui, sans-serif;
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-text);
+  }
+
+  /* Focus visible coherente */
+  *:focus-visible {
+    @apply outline-none ring-2 ring-orange-400 ring-offset-2;
+  }
+
+  /* Imágenes responsive por defecto */
+  img {
+    @apply max-w-full;
+  }
+}
+
+/* ── Utilidades de componentes ─────────────────────────────── */
+@layer components {
+  /* Contenedor principal del sitio */
+  .container-site {
+    @apply max-w-6xl mx-auto px-4 sm:px-6;
+  }
+
+  /* Botón primario naranja */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2
+           px-5 py-2.5 rounded-xl
+           bg-orange-500 hover:bg-orange-600
+           text-white text-sm font-medium
+           transition-colors duration-150
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  /* Botón secundario (outline) */
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2
+           px-5 py-2.5 rounded-xl
+           border border-stone-200 hover:border-stone-300
+           bg-white hover:bg-stone-50
+           text-stone-700 text-sm font-medium
+           transition-colors duration-150;
+  }
+
+  /* Input base */
+  .input-base {
+    @apply w-full px-4 py-2.5 text-sm rounded-xl
+           border border-stone-200
+           focus:outline-none focus:ring-2 focus:ring-orange-300
+           bg-white placeholder-stone-400;
+  }
+
+  /* Tarjeta base */
+  .card {
+    @apply bg-white rounded-2xl border border-stone-100 overflow-hidden;
+  }
+
+  /* Badge de categoría */
+  .badge {
+    @apply inline-flex items-center px-2.5 py-1
+           rounded-full text-xs font-medium;
+  }
+
+  /* Sección con título */
+  .section-title {
+    @apply text-xl font-bold text-stone-900;
+  }
+
+  /* Prose para contenido largo (biografía, etc.) */
+  .prose-receta {
+    @apply text-stone-600 text-sm leading-relaxed space-y-4;
+  }
+  .prose-receta p { @apply mb-0; }
+  .prose-receta strong { @apply font-semibold text-stone-800; }
+}
+
+/* ── Animaciones ───────────────────────────────────────────── */
+@layer utilities {
+  /* Fade in suave para elementos que aparecen en pantalla */
+  .animate-fade-in {
+    animation: fadeIn 0.4s ease-out both;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0);   }
+  }
+
+  /* Skeleton loader */
+  .skeleton {
+    @apply bg-stone-200 rounded animate-pulse;
+  }
+
+  /* Line clamp utilitario extra */
+  .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .line-clamp-3 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+}
