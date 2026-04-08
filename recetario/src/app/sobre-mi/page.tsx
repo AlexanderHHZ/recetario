@@ -9,7 +9,7 @@ import type { Metadata } from 'next'
 
 export const metadata: Metadata = {
   title:       'Sobre mí',
-  description: 'Conoce al Dr. Edgar, médico y creador del canal Ingrediente 791.',
+  description: 'Conoce al Dr. Edgar, ingeniero y creador del canal Ingrediente 791.',
 }
 
 // Íconos de redes sociales
@@ -67,7 +67,7 @@ export default function SobreMiPage() {
             {/* PLACEHOLDER — reemplazar con contenido real del creador */}
             <div className="prose prose-stone prose-sm max-w-none space-y-4 text-stone-600 leading-relaxed">
               <p>
-                Médico de formación y cocinero por vocación. Mi trayectoria en el mundo de la salud me llevó a descubrir la cocina no como un hobby, sino como una extensión natural de mi pasión por el bienestar humano.
+                Ingeniero Electrónico de formación y cocinero por vocación. Mi trayectoria en el mundo de la ingenieria me llevó a descubrir la cocina no como un hobby, sino como una extensión natural de mi pasión por el bien comer.
               </p>
               <p>
                 Llevo más de {new Date().getFullYear() - 2018} años documentando recetas que combinan sabor con ciencia nutricional, buscando siempre que cocinar en casa sea accesible, placentero y, sobre todo, nutritivo.

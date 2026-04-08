@@ -104,7 +104,7 @@ export default async function HomePage() {
       ) : (
         /* Placeholder si no hay recetas aún */
         <section className="rounded-3xl bg-gradient-to-br from-orange-50 to-amber-50 border border-orange-100 p-12 text-center">
-          <p className="text-stone-400 text-sm">Las recetas aparecerán aquí una vez que se publiquen desde el panel admin.</p>
+          <p className="text-stone-400 text-sm">La Receta de la semana.</p>
         </section>
       )}
 
