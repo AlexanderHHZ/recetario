@@ -1,409 +1,371 @@
 -- ============================================================
---  RECETARIO DIGITAL — Schema DDL para Supabase (PostgreSQL)
+--  RECETARIO DIGITAL — Script completo unificado
 --  Ingrediente 791
---  v3 — Corrección error 42P17: funciones IMMUTABLE en índices
---       Se agrega wrapper immutable_unaccent() antes de cualquier
---       tabla o índice que lo requiera.
+--
+--  ORDEN DE EJECUCIÓN en Supabase SQL Editor:
+--    1. Este archivo completo (schema + auth + roles + seeds)
+--
+--  Incluye:
+--    • Schema v3 con los 5 cambios de robustez
+--    • Fix 42P17 (immutable_unaccent)
+--    • Migración Auth + Roles
+--    • Usuarios de prueba (lector y superadmin)
 -- ============================================================
 
+-- ── Extensiones ─────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "unaccent";
 
--- ============================================================
--- FIX 42P17: Wrapper IMMUTABLE para unaccent
--- ------------------------------------------------------------
--- PostgreSQL exige que toda función usada en:
---   • columnas GENERATED ALWAYS AS (...) STORED
---   • expresiones de índices (UNIQUE INDEX, GIN, B-tree)
--- esté marcada como IMMUTABLE (mismo input = mismo output siempre).
--- La función pública.unaccent() original es STABLE, no IMMUTABLE,
--- por eso el motor la rechaza. Este wrapper la re-declara como
--- IMMUTABLE para satisfacer esa restricción de forma segura.
--- ============================================================
+-- ── Fix 42P17: wrapper IMMUTABLE para unaccent ───────────────
 CREATE OR REPLACE FUNCTION immutable_unaccent(text)
 RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT AS
 $$
-    SELECT public.unaccent($1);
+  SELECT public.unaccent($1);
 $$;
 
 COMMENT ON FUNCTION immutable_unaccent(text) IS
-    'Wrapper IMMUTABLE de public.unaccent(). Requerido para usarse
-     en índices funcionales y columnas GENERATED ALWAYS. No invocar
-     en código de aplicación — usar unaccent() directamente allí.';
+  'Wrapper IMMUTABLE de public.unaccent(). Requerido para índices funcionales y columnas GENERATED ALWAYS.';
 
 -- ============================================================
 -- 1. USUARIOS
 -- ============================================================
 CREATE TABLE usuarios (
-    id         UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
-    email      TEXT        NOT NULL UNIQUE,
-    nombre     TEXT        NOT NULL,
-    rol        TEXT        NOT NULL DEFAULT 'editor'
-                               CHECK (rol IN ('superadmin', 'editor')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id         UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  auth_id    UUID        UNIQUE REFERENCES auth.users(id) ON DELETE CASCADE,
+  email      TEXT        NOT NULL UNIQUE,
+  nombre     TEXT        NOT NULL,
+  rol        TEXT        NOT NULL DEFAULT 'lector'
+                             CHECK (rol IN ('lector', 'editor', 'superadmin')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-COMMENT ON TABLE  usuarios     IS 'Usuarios del panel de administración (Payload CMS).';
-COMMENT ON COLUMN usuarios.rol IS 'superadmin: acceso total. editor: solo gestión de recetas.';
+CREATE INDEX idx_usuarios_auth_id ON usuarios(auth_id);
+
+COMMENT ON TABLE  usuarios     IS 'Perfiles de usuario vinculados a Supabase Auth.';
+COMMENT ON COLUMN usuarios.rol IS 'lector: solo reseñas. editor: gestión recetas. superadmin: acceso total.';
+
+-- ── Trigger: crear perfil automáticamente al registrarse ────
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
+BEGIN
+  INSERT INTO public.usuarios (auth_id, email, nombre, rol)
+  VALUES (
+    NEW.id,
+    NEW.email,
+    COALESCE(NEW.raw_user_meta_data->>'nombre', split_part(NEW.email, '@', 1)),
+    'lector'
+  )
+  ON CONFLICT (auth_id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
 -- ============================================================
--- 2. CATEGORÍAS / ETIQUETAS
+-- 2. CATEGORÍAS
 -- ============================================================
 CREATE TABLE categorias (
-    id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    nombre    TEXT NOT NULL UNIQUE,
-    slug      TEXT NOT NULL UNIQUE,
-    color_hex TEXT DEFAULT '#6B7280'
-                  CHECK (color_hex ~ '^#[0-9A-Fa-f]{6}$')
+  id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  nombre    TEXT NOT NULL UNIQUE,
+  slug      TEXT NOT NULL UNIQUE,
+  color_hex TEXT DEFAULT '#6B7280'
+                CHECK (color_hex ~ '^#[0-9A-Fa-f]{6}$')
 );
 
-COMMENT ON TABLE  categorias           IS 'Etiquetas para filtrar recetas (Desayuno, Vegano, Postre, etc.).';
-COMMENT ON COLUMN categorias.slug      IS 'Versión URL-friendly. Ej: desayuno, sin-gluten.';
-COMMENT ON COLUMN categorias.color_hex IS 'Color de la etiqueta en la UI (#RRGGBB).';
+COMMENT ON TABLE categorias IS 'Etiquetas para filtrar recetas.';
 
 -- ============================================================
 -- 3. INGREDIENTES
---    C2: Índice único funcional con immutable_unaccent().
---        "Harina", "harina" y "HARINA" = mismo ingrediente.
 -- ============================================================
 CREATE TABLE ingredientes (
-    id     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    nombre TEXT NOT NULL,
-    slug   TEXT NOT NULL UNIQUE
+  id     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  nombre TEXT NOT NULL,
+  slug   TEXT NOT NULL UNIQUE
 );
 
--- C2 — immutable_unaccent() permite usar la expresión en un UNIQUE INDEX
+-- Previene duplicados semánticos (Harina = harina = HARINA)
 CREATE UNIQUE INDEX idx_ingredientes_nombre_normalizado
-    ON ingredientes (lower(immutable_unaccent(nombre)));
+  ON ingredientes (lower(immutable_unaccent(nombre)));
 
-COMMENT ON TABLE  ingredientes      IS 'Catálogo maestro de ingredientes. Sin duplicados semánticos.';
-COMMENT ON COLUMN ingredientes.slug IS 'Para URLs limpias. Ej: harina-de-trigo.';
+COMMENT ON TABLE ingredientes IS 'Catálogo maestro de ingredientes sin duplicados semánticos.';
 
 -- ============================================================
--- 4. RECETAS (tabla central)
---    C1: tiempo_minutos, porciones, dificultad.
---    C5: sin imagen_url (migrada a receta_imagenes).
---    search_vector usa immutable_unaccent() — fix 42P17.
+-- 4. RECETAS
 -- ============================================================
 CREATE TABLE recetas (
-    id                UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
-    titulo            TEXT        NOT NULL,
-    descripcion       TEXT,
-    video_youtube_url TEXT        CHECK (
-                                      video_youtube_url IS NULL OR
-                                      video_youtube_url ~ 'youtube\.com|youtu\.be'
-                                  ),
-    slug              TEXT        NOT NULL UNIQUE,
-    publicada         BOOLEAN     NOT NULL DEFAULT FALSE,
-    usuario_id        UUID        REFERENCES usuarios(id) ON DELETE SET NULL,
-
-    -- C1: Metadata estructurada
-    tiempo_minutos    SMALLINT    CHECK (tiempo_minutos > 0),
-    porciones         SMALLINT    CHECK (porciones > 0),
-    dificultad        TEXT        CHECK (dificultad IN ('fácil', 'media', 'difícil')),
-
-    -- FTS: immutable_unaccent() reemplaza unaccent() para satisfacer IMMUTABLE
-    search_vector     TSVECTOR    GENERATED ALWAYS AS (
-                                      to_tsvector('spanish',
-                                          immutable_unaccent(coalesce(titulo, ''))      || ' ' ||
-                                          immutable_unaccent(coalesce(descripcion, '')) || ' ' ||
-                                          coalesce(dificultad, '')
-                                      )
-                                  ) STORED,
-
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id                UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  titulo            TEXT        NOT NULL,
+  descripcion       TEXT,
+  video_youtube_url TEXT        CHECK (
+                                    video_youtube_url IS NULL OR
+                                    video_youtube_url ~ 'youtube\.com|youtu\.be'
+                                ),
+  slug              TEXT        NOT NULL UNIQUE,
+  publicada         BOOLEAN     NOT NULL DEFAULT FALSE,
+  usuario_id        UUID        REFERENCES usuarios(id) ON DELETE SET NULL,
+  tiempo_minutos    SMALLINT    CHECK (tiempo_minutos > 0),
+  porciones         SMALLINT    CHECK (porciones > 0),
+  dificultad        TEXT        CHECK (dificultad IN ('fácil', 'media', 'difícil')),
+  search_vector     TSVECTOR    GENERATED ALWAYS AS (
+                                    to_tsvector('spanish',
+                                      immutable_unaccent(coalesce(titulo, ''))      || ' ' ||
+                                      immutable_unaccent(coalesce(descripcion, '')) || ' ' ||
+                                      coalesce(dificultad, '')
+                                    )
+                                ) STORED,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-COMMENT ON TABLE  recetas                   IS 'Tabla central. Una fila = una receta del canal Ingrediente 791.';
-COMMENT ON COLUMN recetas.publicada         IS 'FALSE = borrador, visible solo en el panel admin.';
-COMMENT ON COLUMN recetas.tiempo_minutos    IS 'C1: Tiempo total de preparación en minutos.';
-COMMENT ON COLUMN recetas.porciones         IS 'C1: Número de porciones que rinde la receta.';
-COMMENT ON COLUMN recetas.dificultad        IS 'C1: fácil | media | difícil.';
-COMMENT ON COLUMN recetas.search_vector     IS 'Columna generada para FTS en español. No editar manualmente.';
-COMMENT ON COLUMN recetas.video_youtube_url IS 'URL completa del video. Validada contra dominio YouTube.';
-
--- Trigger: sincroniza updated_at en cada UPDATE
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
+  NEW.updated_at = NOW();
+  RETURN NEW;
 END;
 $$;
 
 CREATE TRIGGER trg_recetas_updated_at
-    BEFORE UPDATE ON recetas
-    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  BEFORE UPDATE ON recetas
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- ============================================================
--- 5. TABLA INTERMEDIA: receta_ingredientes
+-- 5. RECETA_INGREDIENTES
 -- ============================================================
 CREATE TABLE receta_ingredientes (
-    receta_id      UUID     NOT NULL REFERENCES recetas(id)      ON DELETE CASCADE,
-    ingrediente_id UUID     NOT NULL REFERENCES ingredientes(id) ON DELETE RESTRICT,
-    cantidad       TEXT     NOT NULL,
-    orden          SMALLINT NOT NULL DEFAULT 0 CHECK (orden >= 0),
-
-    PRIMARY KEY (receta_id, ingrediente_id)
+  receta_id      UUID     NOT NULL REFERENCES recetas(id)      ON DELETE CASCADE,
+  ingrediente_id UUID     NOT NULL REFERENCES ingredientes(id) ON DELETE RESTRICT,
+  cantidad       TEXT     NOT NULL,
+  orden          SMALLINT NOT NULL DEFAULT 0 CHECK (orden >= 0),
+  PRIMARY KEY (receta_id, ingrediente_id)
 );
 
-COMMENT ON TABLE  receta_ingredientes          IS 'Relación N:M entre recetas e ingredientes con cantidad específica.';
-COMMENT ON COLUMN receta_ingredientes.cantidad IS 'Texto libre: "500g", "2 tazas", "al gusto".';
-COMMENT ON COLUMN receta_ingredientes.orden    IS 'Orden de aparición en la UI de la receta.';
-
 -- ============================================================
--- 6. TABLA INTERMEDIA: receta_categorias
+-- 6. RECETA_CATEGORIAS
 -- ============================================================
 CREATE TABLE receta_categorias (
-    receta_id    UUID NOT NULL REFERENCES recetas(id)    ON DELETE CASCADE,
-    categoria_id UUID NOT NULL REFERENCES categorias(id) ON DELETE CASCADE,
-
-    PRIMARY KEY (receta_id, categoria_id)
+  receta_id    UUID NOT NULL REFERENCES recetas(id)    ON DELETE CASCADE,
+  categoria_id UUID NOT NULL REFERENCES categorias(id) ON DELETE CASCADE,
+  PRIMARY KEY (receta_id, categoria_id)
 );
 
-COMMENT ON TABLE receta_categorias IS 'Una receta puede tener múltiples categorías (Postre + Sin Gluten + Rápido).';
-
 -- ============================================================
--- 7. PASOS — C3: instrucciones estructuradas
+-- 7. PASOS
 -- ============================================================
 CREATE TABLE pasos (
-    id          UUID     PRIMARY KEY DEFAULT uuid_generate_v4(),
-    receta_id   UUID     NOT NULL REFERENCES recetas(id) ON DELETE CASCADE,
-    numero      SMALLINT NOT NULL CHECK (numero > 0),
-    descripcion TEXT     NOT NULL,
-    imagen_url  TEXT,
-
-    UNIQUE (receta_id, numero)
+  id          UUID     PRIMARY KEY DEFAULT uuid_generate_v4(),
+  receta_id   UUID     NOT NULL REFERENCES recetas(id) ON DELETE CASCADE,
+  numero      SMALLINT NOT NULL CHECK (numero > 0),
+  descripcion TEXT     NOT NULL,
+  imagen_url  TEXT,
+  UNIQUE (receta_id, numero)
 );
 
-CREATE INDEX idx_pasos_receta ON pasos(receta_id);
-
-COMMENT ON TABLE  pasos            IS 'C3: Instrucciones como filas ordenadas. Habilita UI interactiva paso-a-paso.';
-COMMENT ON COLUMN pasos.numero     IS 'Posición del paso (1, 2, 3...). Único por receta.';
-COMMENT ON COLUMN pasos.imagen_url IS 'Foto opcional del resultado del paso (Cloudinary URL).';
-
 -- ============================================================
--- 8. IMÁGENES DE RECETA — C5: reemplaza imagen_url en recetas
+-- 8. RECETA_IMAGENES
 -- ============================================================
 CREATE TABLE receta_imagenes (
-    id           UUID     PRIMARY KEY DEFAULT uuid_generate_v4(),
-    receta_id    UUID     NOT NULL REFERENCES recetas(id) ON DELETE CASCADE,
-    url          TEXT     NOT NULL,
-    alt_text     TEXT,
-    es_principal BOOLEAN  NOT NULL DEFAULT FALSE,
-    orden        SMALLINT NOT NULL DEFAULT 0
+  id           UUID     PRIMARY KEY DEFAULT uuid_generate_v4(),
+  receta_id    UUID     NOT NULL REFERENCES recetas(id) ON DELETE CASCADE,
+  url          TEXT     NOT NULL,
+  alt_text     TEXT,
+  es_principal BOOLEAN  NOT NULL DEFAULT FALSE,
+  orden        SMALLINT NOT NULL DEFAULT 0
 );
 
--- C5: Una sola imagen principal por receta (índice parcial)
 CREATE UNIQUE INDEX idx_imagen_principal
-    ON receta_imagenes(receta_id)
-    WHERE es_principal = TRUE;
-
-CREATE INDEX idx_imagenes_receta ON receta_imagenes(receta_id, orden);
-
-COMMENT ON TABLE  receta_imagenes              IS 'C5: Galería de imágenes por receta. Reemplaza imagen_url.';
-COMMENT ON COLUMN receta_imagenes.es_principal IS 'Solo una imagen puede ser principal por receta (enforced por índice).';
-COMMENT ON COLUMN receta_imagenes.alt_text     IS 'Texto alternativo para accesibilidad y SEO.';
+  ON receta_imagenes(receta_id)
+  WHERE es_principal = TRUE;
 
 -- ============================================================
--- 9. RESEÑAS / COMENTARIOS — C4: rate limiting por ip_hash
+-- 9. RESEÑAS
 -- ============================================================
 CREATE TABLE resenas (
-    id           UUID     PRIMARY KEY DEFAULT uuid_generate_v4(),
-    receta_id    UUID     NOT NULL REFERENCES recetas(id) ON DELETE CASCADE,
-    autor_nombre TEXT     NOT NULL CHECK (char_length(autor_nombre) BETWEEN 2 AND 60),
-    calificacion SMALLINT NOT NULL CHECK (calificacion BETWEEN 1 AND 5),
-    comentario   TEXT     CHECK (char_length(comentario) <= 1000),
-    aprobada     BOOLEAN  NOT NULL DEFAULT FALSE,
-    ip_hash      TEXT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id           UUID     PRIMARY KEY DEFAULT uuid_generate_v4(),
+  receta_id    UUID     NOT NULL REFERENCES recetas(id) ON DELETE CASCADE,
+  autor_nombre TEXT     NOT NULL CHECK (char_length(autor_nombre) BETWEEN 2 AND 60),
+  calificacion SMALLINT NOT NULL CHECK (calificacion BETWEEN 1 AND 5),
+  comentario   TEXT     CHECK (char_length(comentario) <= 1000),
+  aprobada     BOOLEAN  NOT NULL DEFAULT FALSE,
+  ip_hash      TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-COMMENT ON TABLE  resenas              IS 'Reseñas públicas. Requieren aprobación manual del admin.';
-COMMENT ON COLUMN resenas.aprobada     IS 'El admin aprueba desde Payload CMS antes de publicar.';
-COMMENT ON COLUMN resenas.calificacion IS 'Entero de 1 a 5 estrellas.';
-COMMENT ON COLUMN resenas.ip_hash      IS 'C4: SHA-256 de la IP. Rate limiting sin almacenar datos personales.';
+-- ============================================================
+-- 10. MENSAJES DE CONTACTO
+-- ============================================================
+CREATE TABLE mensajes_contacto (
+  id         UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  nombre     TEXT        NOT NULL CHECK (char_length(nombre)  BETWEEN 2 AND 80),
+  email      TEXT        NOT NULL CHECK (email ~ '^[^@]+@[^@]+\.[^@]+$'),
+  asunto     TEXT        NOT NULL CHECK (char_length(asunto)  BETWEEN 3 AND 120),
+  mensaje    TEXT        NOT NULL CHECK (char_length(mensaje) BETWEEN 10 AND 3000),
+  leido      BOOLEAN     NOT NULL DEFAULT FALSE,
+  ip_hash    TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- ============================================================
 -- ÍNDICES DE OPTIMIZACIÓN
 -- ============================================================
+CREATE INDEX idx_recetas_publicada     ON recetas(publicada)      WHERE publicada = TRUE;
+CREATE INDEX idx_recetas_slug          ON recetas(slug);
+CREATE INDEX idx_recetas_dificultad    ON recetas(dificultad)     WHERE publicada = TRUE;
+CREATE INDEX idx_recetas_tiempo        ON recetas(tiempo_minutos) WHERE publicada = TRUE;
+CREATE INDEX idx_recetas_fts           ON recetas USING GIN(search_vector);
 
--- Índice parcial: solo recetas publicadas (las que sirve el frontend)
-CREATE INDEX idx_recetas_publicada
-    ON recetas(publicada)
-    WHERE publicada = TRUE;
+CREATE INDEX idx_categorias_slug       ON categorias(slug);
+CREATE INDEX idx_ingredientes_slug     ON ingredientes(slug);
 
--- Slugs para resolución de rutas Next.js /recetas/[slug]
-CREATE INDEX idx_recetas_slug      ON recetas(slug);
-CREATE INDEX idx_categorias_slug   ON categorias(slug);
-CREATE INDEX idx_ingredientes_slug ON ingredientes(slug);
+CREATE INDEX idx_ri_receta_id          ON receta_ingredientes(receta_id);
+CREATE INDEX idx_ri_ingrediente_id     ON receta_ingredientes(ingrediente_id);
+CREATE INDEX idx_ri_ingrediente_gin    ON receta_ingredientes USING GIN(to_tsvector('simple', ingrediente_id::text));
 
--- FK lookups: acelera JOINs y CASCADE deletes
-CREATE INDEX idx_ri_receta_id      ON receta_ingredientes(receta_id);
-CREATE INDEX idx_ri_ingrediente_id ON receta_ingredientes(ingrediente_id);
-CREATE INDEX idx_rc_receta_id      ON receta_categorias(receta_id);
-CREATE INDEX idx_rc_categoria_id   ON receta_categorias(categoria_id);
-CREATE INDEX idx_resenas_receta_id ON resenas(receta_id);
+CREATE INDEX idx_rc_receta_id          ON receta_categorias(receta_id);
+CREATE INDEX idx_rc_categoria_id       ON receta_categorias(categoria_id);
 
--- C1: Filtros de metadata en recetas publicadas
-CREATE INDEX idx_recetas_dificultad ON recetas(dificultad)     WHERE publicada = TRUE;
-CREATE INDEX idx_recetas_tiempo     ON recetas(tiempo_minutos) WHERE publicada = TRUE;
+CREATE INDEX idx_pasos_receta          ON pasos(receta_id);
+CREATE INDEX idx_imagenes_receta       ON receta_imagenes(receta_id, orden);
 
--- Moderación: reseñas pendientes ordenadas por fecha
-CREATE INDEX idx_resenas_moderacion
-    ON resenas(aprobada, created_at DESC)
-    WHERE aprobada = FALSE;
+CREATE INDEX idx_resenas_receta_id     ON resenas(receta_id);
+CREATE INDEX idx_resenas_moderacion    ON resenas(aprobada, created_at DESC) WHERE aprobada = FALSE;
+CREATE INDEX idx_resenas_ip_reciente   ON resenas(receta_id, ip_hash, created_at DESC);
 
--- C4: Rate limiting — envíos recientes por IP + receta
-CREATE INDEX idx_resenas_ip_reciente
-    ON resenas(receta_id, ip_hash, created_at DESC);
-
--- GIN: motor de búsqueda full-text (buscador principal de la plataforma)
-CREATE INDEX idx_recetas_fts
-    ON recetas USING GIN(search_vector);
-
--- GIN: "recetas que contienen ingrediente X"
-CREATE INDEX idx_ri_ingrediente_gin
-    ON receta_ingredientes USING GIN(to_tsvector('simple', ingrediente_id::text));
+CREATE INDEX idx_mensajes_no_leidos    ON mensajes_contacto(leido, created_at DESC) WHERE leido = FALSE;
+CREATE INDEX idx_mensajes_email        ON mensajes_contacto(email);
+CREATE INDEX idx_mensajes_ip_reciente  ON mensajes_contacto(ip_hash, created_at DESC);
 
 -- ============================================================
--- SEED: datos de ejemplo mínimos para arrancar
+-- ROW LEVEL SECURITY
+-- ============================================================
+ALTER TABLE usuarios          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE resenas            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE mensajes_contacto  ENABLE ROW LEVEL SECURITY;
+
+-- Usuarios: cualquiera puede leer, solo el propio usuario puede editar
+CREATE POLICY "usuarios_select_public" ON usuarios
+  FOR SELECT USING (true);
+
+CREATE POLICY "usuarios_update_own" ON usuarios
+  FOR UPDATE USING (auth_id = auth.uid());
+
+-- Reseñas: público lee las aprobadas, autenticados pueden insertar
+CREATE POLICY "resenas_select_aprobadas" ON resenas
+  FOR SELECT USING (aprobada = true);
+
+CREATE POLICY "resenas_insert_auth" ON resenas
+  FOR INSERT WITH CHECK (auth.uid() IS NOT NULL);
+
+-- Mensajes: cualquiera puede insertar (formulario público)
+CREATE POLICY "mensajes_insert_public" ON mensajes_contacto
+  FOR INSERT WITH CHECK (true);
+
+-- ============================================================
+-- FUNCIONES HELPER
 -- ============================================================
 
-INSERT INTO categorias (nombre, slug, color_hex) VALUES
-    ('Desayuno',   'desayuno',   '#FAEEDA'),
-    ('Postre',     'postre',     '#FBEAF0'),
-    ('Vegano',     'vegano',     '#EAF3DE'),
-    ('Sin gluten', 'sin-gluten', '#E1F5EE'),
-    ('Rápido',     'rapido',     '#EEEDFE');
+-- Rol del usuario actual
+CREATE OR REPLACE FUNCTION public.get_my_rol()
+RETURNS TEXT LANGUAGE sql STABLE SECURITY DEFINER AS $$
+  SELECT rol FROM public.usuarios WHERE auth_id = auth.uid() LIMIT 1;
+$$;
 
-INSERT INTO usuarios (email, nombre, rol) VALUES
-    ('admin@ingrediente791.com', 'Admin Principal', 'superadmin');
+-- Rate limiting reseñas (max 3 por receta / IP / 24h)
+CREATE OR REPLACE FUNCTION puede_comentar(p_receta_id UUID, p_ip_hash TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
+  SELECT COUNT(*) < 3
+  FROM   resenas
+  WHERE  receta_id  = p_receta_id
+    AND  ip_hash    = p_ip_hash
+    AND  created_at > NOW() - INTERVAL '24 hours';
+$$;
+
+-- Rate limiting contacto (max 3 mensajes / IP / 24h)
+CREATE OR REPLACE FUNCTION puede_enviar_mensaje(p_ip_hash TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
+  SELECT COUNT(*) < 3
+  FROM   mensajes_contacto
+  WHERE  ip_hash    = p_ip_hash
+    AND  created_at > NOW() - INTERVAL '24 hours';
+$$;
 
 -- ============================================================
--- VISTA: galería pública con todos los campos necesarios
+-- VISTA: resumen para galería
 -- ============================================================
 CREATE VIEW resumen_recetas AS
 SELECT
-    r.id,
-    r.titulo,
-    r.slug,
-    r.publicada,
-    r.tiempo_minutos,
-    r.porciones,
-    r.dificultad,
-    r.created_at,
-    (SELECT url
-     FROM   receta_imagenes
-     WHERE  receta_id = r.id AND es_principal = TRUE
-     LIMIT  1)                             AS imagen_principal_url,
-    COUNT(DISTINCT re.id)                  AS total_resenas,
-    ROUND(AVG(re.calificacion), 1)         AS calificacion_promedio,
-    ARRAY_AGG(DISTINCT c.nombre)           AS categorias,
-    ARRAY_AGG(DISTINCT i.nombre)           AS ingredientes,
-    (SELECT COUNT(*)
-     FROM   pasos
-     WHERE  receta_id = r.id)              AS total_pasos
+  r.id,
+  r.titulo,
+  r.slug,
+  r.publicada,
+  r.tiempo_minutos,
+  r.porciones,
+  r.dificultad,
+  r.created_at,
+  (SELECT url FROM receta_imagenes
+   WHERE  receta_id = r.id AND es_principal = TRUE
+   LIMIT  1)                              AS imagen_principal_url,
+  COUNT(DISTINCT re.id)                   AS total_resenas,
+  ROUND(AVG(re.calificacion), 1)          AS calificacion_promedio,
+  ARRAY_AGG(DISTINCT c.nombre)            AS categorias,
+  ARRAY_AGG(DISTINCT i.nombre)            AS ingredientes,
+  (SELECT COUNT(*) FROM pasos WHERE receta_id = r.id) AS total_pasos
 FROM recetas r
-LEFT JOIN resenas             re ON re.receta_id    = r.id AND re.aprobada = TRUE
-LEFT JOIN receta_categorias   rc ON rc.receta_id    = r.id
-LEFT JOIN categorias           c ON c.id            = rc.categoria_id
-LEFT JOIN receta_ingredientes ri ON ri.receta_id    = r.id
-LEFT JOIN ingredientes          i ON i.id           = ri.ingrediente_id
+LEFT JOIN resenas             re ON re.receta_id   = r.id AND re.aprobada = TRUE
+LEFT JOIN receta_categorias   rc ON rc.receta_id   = r.id
+LEFT JOIN categorias           c ON c.id           = rc.categoria_id
+LEFT JOIN receta_ingredientes ri ON ri.receta_id   = r.id
+LEFT JOIN ingredientes         i ON i.id           = ri.ingrediente_id
 GROUP BY r.id;
 
-COMMENT ON VIEW resumen_recetas IS
-    'Vista desnormalizada para la galería. Una sola query entrega
-     todo lo que necesita la tarjeta de receta en Next.js.';
+-- ============================================================
+-- SEED: categorías iniciales
+-- ============================================================
+INSERT INTO categorias (nombre, slug, color_hex) VALUES
+  ('Desayuno',   'desayuno',   '#FAEEDA'),
+  ('Postre',     'postre',     '#FBEAF0'),
+  ('Vegano',     'vegano',     '#EAF3DE'),
+  ('Sin gluten', 'sin-gluten', '#E1F5EE'),
+  ('Rápido',     'rapido',     '#EEEDFE'),
+  ('Cena',       'cena',       '#E6F1FB'),
+  ('Comida',     'comida',     '#EAF3DE');
 
 -- ============================================================
--- FUNCIÓN HELPER: rate limiting para reseñas (C4)
---
--- Uso desde Next.js API Route:
---   const { data } = await supabase
---     .rpc('puede_comentar', { p_receta_id: id, p_ip_hash: hash })
---
--- Retorna TRUE  → el usuario puede enviar reseña.
--- Retorna FALSE → límite alcanzado (3 reseñas / receta / 24 h).
+-- SEED: receta de ejemplo para probar la galería
 -- ============================================================
-CREATE OR REPLACE FUNCTION puede_comentar(p_receta_id UUID, p_ip_hash TEXT)
-RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
-    SELECT COUNT(*) < 3
-    FROM   resenas
-    WHERE  receta_id  = p_receta_id
-      AND  ip_hash    = p_ip_hash
-      AND  created_at > NOW() - INTERVAL '24 hours';
-$$;
-
-COMMENT ON FUNCTION puede_comentar(UUID, TEXT) IS
-    'C4: TRUE si la IP puede comentar (límite: 3 reseñas / receta / 24 h).';
-
-    -- ============================================================
---  RECETARIO DIGITAL — Módulo: Contacto
---  Ingrediente 791
---  Archivo independiente: ejecutar DESPUÉS de schema_v3.sql
--- ============================================================
-
--- ============================================================
--- TABLA: mensajes_contacto
--- ------------------------------------------------------------
--- Almacena los mensajes del formulario de contacto.
--- El estado leido/no_leido se gestiona desde el panel de
--- Payload CMS. No se relaciona con la tabla usuarios porque
--- los remitentes son visitantes anónimos (patrocinadores, etc.)
--- ============================================================
-CREATE TABLE mensajes_contacto (
-    id         UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
-    nombre     TEXT        NOT NULL CHECK (char_length(nombre)  BETWEEN 2 AND 80),
-    email      TEXT        NOT NULL CHECK (email ~ '^[^@]+@[^@]+\.[^@]+$'),
-    asunto     TEXT        NOT NULL CHECK (char_length(asunto)  BETWEEN 3 AND 120),
-    mensaje    TEXT        NOT NULL CHECK (char_length(mensaje) BETWEEN 10 AND 3000),
-    leido      BOOLEAN     NOT NULL DEFAULT FALSE,
-    -- C4 aplicado también aquí: hash de IP para detectar spam
-    ip_hash    TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+INSERT INTO recetas (titulo, descripcion, video_youtube_url, slug, publicada, tiempo_minutos, porciones, dificultad)
+VALUES (
+  'Tacos de canasta clásicos',
+  'La receta más querida del canal. Tacos jugosos, fáciles y perfectos para cualquier ocasión.',
+  'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+  'tacos-de-canasta-clasicos',
+  TRUE,
+  45,
+  12,
+  'fácil'
 );
 
-COMMENT ON TABLE  mensajes_contacto         IS 'Mensajes del formulario de contacto. Gestionados desde Payload CMS.';
-COMMENT ON COLUMN mensajes_contacto.leido   IS 'FALSE = no leído (aparece resaltado en el panel admin).';
-COMMENT ON COLUMN mensajes_contacto.ip_hash IS 'SHA-256 de la IP. Permite detectar spam sin guardar datos personales.';
-
 -- ============================================================
--- ÍNDICES
+-- USUARIOS DE PRUEBA
+-- IMPORTANTE: estos se crean en auth.users vía Supabase Auth.
+-- Después de ejecutar este script, sigue las instrucciones
+-- del README para crear las cuentas desde la UI de Supabase.
 -- ============================================================
 
--- El admin filtrará frecuentemente por no leídos
-CREATE INDEX idx_mensajes_no_leidos
-    ON mensajes_contacto(leido, created_at DESC)
-    WHERE leido = FALSE;
+-- Instrucciones post-ejecución:
+-- 1. Ve a Authentication → Users → "Add user" → "Create new user"
+-- 2. Crea usuario lector:
+--      Email:    lector@test.com
+--      Password: Test1234!
+-- 3. Crea usuario admin:
+--      Email:    admin@ingrediente791.com
+--      Password: Admin1234!
+-- 4. Ejecuta el UPDATE de abajo para dar rol superadmin al admin:
 
--- Búsqueda por email (el admin querrá ver todos los mensajes de un remitente)
-CREATE INDEX idx_mensajes_email
-    ON mensajes_contacto(email);
-
--- Rate limiting: máximo 3 mensajes por IP en 24 horas
-CREATE INDEX idx_mensajes_ip_reciente
-    ON mensajes_contacto(ip_hash, created_at DESC);
-
--- ============================================================
--- FUNCIÓN HELPER: rate limiting para el formulario de contacto
---
--- Uso desde Next.js API Route:
---   const { data } = await supabase
---     .rpc('puede_enviar_mensaje', { p_ip_hash: hash })
---
--- Retorna TRUE  → puede enviar mensaje.
--- Retorna FALSE → límite alcanzado (3 mensajes / IP / 24 h).
--- ============================================================
-CREATE OR REPLACE FUNCTION puede_enviar_mensaje(p_ip_hash TEXT)
-RETURNS BOOLEAN LANGUAGE sql STABLE PARALLEL SAFE AS $$
-    SELECT COUNT(*) < 3
-    FROM   mensajes_contacto
-    WHERE  ip_hash    = p_ip_hash
-      AND  created_at > NOW() - INTERVAL '24 hours';
-$$;
-
-COMMENT ON FUNCTION puede_enviar_mensaje(TEXT) IS
-    'TRUE si la IP puede enviar mensaje de contacto (límite: 3 / 24 h).';
+-- ⚠️  EJECUTAR DESPUÉS DE CREAR LOS USUARIOS EN AUTH:
+-- UPDATE usuarios SET rol = 'superadmin' WHERE email = 'admin@ingrediente791.com';
